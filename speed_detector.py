@@ -173,23 +173,39 @@ def create_video_writer(input_video_path, fps, width, height):
         
         # Create timestamp for unique filename
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        output_filename = os.path.join(output_dir, f'processed_video_{timestamp}.avi')
+        output_filename = os.path.join(output_dir, f'processed_video_{timestamp}.mp4')
         
         print(f"Will save processed video to: {output_filename}")
         
-        # Try different codecs in order of preference
-        codecs = ['XVID', 'MJPG', 'MP4V']
-        
-        for codec in codecs:
+        try:
+            # Use H.264 codec for MP4
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # or 'avc1' on some systems
+            out = cv2.VideoWriter(output_filename, fourcc, fps, (width, height))
+            
+            if out.isOpened():
+                print("Successfully created MP4 video writer")
+                return out
+                
+            # Fallback to alternative H.264 codec if first attempt fails
+            fourcc = cv2.VideoWriter_fourcc(*'avc1')
+            out = cv2.VideoWriter(output_filename, fourcc, fps, (width, height))
+            
+            if out.isOpened():
+                print("Successfully created MP4 video writer using alternative codec")
+                return out
+                
+        except Exception as e:
+            print(f"Failed to create MP4 writer: {e}")
+            
+            # Last resort: try x264 codec
             try:
-                fourcc = cv2.VideoWriter_fourcc(*codec)
+                fourcc = cv2.VideoWriter_fourcc(*'x264')
                 out = cv2.VideoWriter(output_filename, fourcc, fps, (width, height))
                 if out.isOpened():
-                    print(f"Successfully created video writer using {codec} codec")
+                    print("Successfully created MP4 video writer using x264 codec")
                     return out
-            except Exception as codec_error:
-                print(f"Failed with codec {codec}: {codec_error}")
-                continue
+            except Exception as e:
+                print(f"Failed to create video writer with x264 codec: {e}")
         
         print("Failed to create video writer with any available codec")
         return None
