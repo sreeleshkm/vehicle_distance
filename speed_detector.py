@@ -37,15 +37,31 @@ class VehicleTracker:
         self.time_since_update = 0
         self.hits = 0
         self.history = []
+        self.last_update_time = time.time()
+        self.confidence = 1.0
         self.update(detection)
     
     def update(self, detection):
         self.bbox = detection
         self.time_since_update = 0
         self.hits += 1
-        self.history.append(detection)
+        self.last_update_time = time.time()
+        
+        # Store position history for movement analysis
+        x, y, w, h = detection
+        centroid = (x + w/2, y + h/2)
+        self.history.append((centroid[0], centroid[1], w, h))
+        
         if len(self.history) > 30:  # Keep only last 30 frames
             self.history.pop(0)
+            
+        # Update confidence based on detection consistency
+        if len(self.history) >= 2:
+            last_w = self.history[-2][2]
+            current_w = w
+            size_change = abs(current_w - last_w) / last_w
+            self.confidence = max(0.1, self.confidence * (1 - size_change))
+        
         return True
 
     def get_state(self):
@@ -116,14 +132,23 @@ def create_video_capture(filename):
         print(f"Error opening video: {e}")
         return None
 
-video = create_video_capture("carsVideo4.mp4")
+video = create_video_capture("carsVideo5.mp4")
 if video is None:
     print("Failed to open video file")
     exit(1)
 
-# Constants for output video size (reduced size for performance)
-WIDTH = 480
-HEIGHT = 640
+# Get input video dimensions and calculate output size maintaining aspect ratio
+input_width = int(video.get(cv2.CAP_PROP_FRAME_WIDTH))
+input_height = int(video.get(cv2.CAP_PROP_FRAME_HEIGHT))
+target_width = 640  # Set your desired width
+
+# Calculate height to maintain aspect ratio
+aspect_ratio = input_height / input_width
+target_height = int(target_width * aspect_ratio)
+
+# Set final dimensions
+WIDTH = target_width
+HEIGHT = target_height
 
 # Known width of vehicle in meters (average)
 KNOWN_WIDTH = 1.8  
@@ -140,11 +165,21 @@ def estimateSpeed(location1, location2):
     speed = d_meters * fps * 3.6  # km/h
     return speed
 
-# Distance Estimation
+# Distance Estimation with improved accuracy for long distances
 def estimateDistance(width_in_pixels):
     if width_in_pixels == 0:
         return 0
-    return (KNOWN_WIDTH * FOCAL_LENGTH) / width_in_pixels
+    
+    # Calculate basic distance
+    distance = (KNOWN_WIDTH * FOCAL_LENGTH) / width_in_pixels
+    
+    # Apply non-linear correction for long distances
+    if distance > 50:
+        # Apply correction factor for better accuracy at long distances
+        correction_factor = 1.0 + (distance - 50) * 0.01
+        distance = distance * correction_factor
+    
+    return distance
 
 # IoU based overlapping check to avoid multiple trackers for same object
 def is_overlapping(x, y, w, h, t_x, t_y, t_w, t_h, threshold=0.6):
@@ -227,11 +262,27 @@ def trackMultipleObjects():
         input_video = "carsVideo4.mp4"
         input_video_path = os.path.abspath(input_video)
 
+        # Get original video FPS and frame count
+        original_fps = int(video.get(cv2.CAP_PROP_FPS))
+        total_frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
+        video_duration = total_frames / original_fps if original_fps > 0 else 0
+        
+        if original_fps == 0:
+            original_fps = 30  # fallback if FPS cannot be determined
+        
         # Create video writer with error handling
-        out = create_video_writer(input_video_path, 10, WIDTH, HEIGHT)
+        out = create_video_writer(input_video_path, original_fps, WIDTH, HEIGHT)
         if out is None:
             print("Failed to create output video file")
             return
+            
+        print(f"\nVideo Analysis:")
+        print(f"- Input dimensions: {WIDTH}x{HEIGHT}")
+        print(f"- Frames per second: {original_fps}")
+        print(f"- Total frames: {total_frames}")
+        print(f"- Video duration: {video_duration:.2f} seconds")
+        print(f"- Frames per second (calculated): {original_fps:.2f}")
+        print("\nProcessing video...")
 
         print(f"Processing input video: {input_video_path}")
         start_time = time.time()
@@ -240,87 +291,169 @@ def trackMultipleObjects():
         print(f"Error initializing tracking: {e}")
         return
 
+    # Initialize FPS calculation variables
+    frame_times = []
+    fps_update_interval = 30  # Update FPS every 30 frames
+    processing_start_time = time.time()
+    
     while True:
+        frame_start_time = time.time()
+        
         rc, image = video.read()
         if type(image) == type(None):
             break
 
-        # Resize frame to YouTube Shorts size (vertical)
-        image = cv2.resize(image, (WIDTH, HEIGHT))
+        # Resize frame maintaining aspect ratio
+        image = cv2.resize(image, (WIDTH, HEIGHT), interpolation=cv2.INTER_AREA)
         resultImage = image.copy()
+        
+        # Calculate FPS
+        frame_times.append(time.time() - frame_start_time)
+        if len(frame_times) > fps_update_interval:
+            frame_times.pop(0)
+        
+        current_fps = len(frame_times) / sum(frame_times)
+        
+        # Update FPS display every 30 frames
+        if frameCounter % fps_update_interval == 0:
+            elapsed_time = time.time() - processing_start_time
+            avg_fps = frameCounter / elapsed_time if elapsed_time > 0 else 0
+            print(f"\rProcessing FPS: {current_fps:.1f} | Average FPS: {avg_fps:.1f} | ", end="")
+        
+        # Add black borders if needed to maintain aspect ratio
+        if resultImage.shape[0] != HEIGHT or resultImage.shape[1] != WIDTH:
+            # Create black canvas
+            canvas = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
+            # Calculate position to center the image
+            y_offset = (HEIGHT - resultImage.shape[0]) // 2
+            x_offset = (WIDTH - resultImage.shape[1]) // 2
+            # Place the image in the center
+            canvas[y_offset:y_offset + resultImage.shape[0], 
+                  x_offset:x_offset + resultImage.shape[1]] = resultImage
+            resultImage = canvas
         frameCounter += 1
 
-        # Reset trackers periodically to prevent drift
-        if time.time() - start_time > 10:
-            vehicle_trackers.clear()
-            last_centroids.clear()
-            speeds.clear()
-            start_time = time.time()
+        # Clear all trackers for each new frame
+        vehicle_trackers.clear()
+        last_centroids.clear()
+        speeds.clear()
+        
+        # Process new frame
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        
+        # Apply background subtraction to detect motion
+        if frameCounter == 1:
+            avg = gray.copy().astype("float")
+            continue
+        
+        # Accumulate the weighted average between the current frame and
+        # previous frames, then compute the difference between the current
+        # frame and running average
+        cv2.accumulateWeighted(gray, avg, 0.2)
+        frameDelta = cv2.absdiff(gray, cv2.convertScaleAbs(avg))
+        
+        # If there's no significant motion, skip this frame
+        if cv2.mean(frameDelta)[0] < 2.0:  # Adjust threshold as needed
+            continue
+            
+        # Apply bilateral filter to reduce noise while preserving edges
+        gray = cv2.bilateralFilter(gray, 11, 17, 17)
+        
+        # Detect vehicles with parameters optimized for long-distance detection
+        cars = carCascade.detectMultiScale(
+            gray, 
+            scaleFactor=1.05,  # Smaller scale factor to detect distant vehicles
+            minNeighbors=5,    # Reduced to detect smaller objects
+            minSize=(20, 20),  # Smaller minimum size for distant vehicles
+            maxSize=(WIDTH, HEIGHT)  # Allow larger maximum size
+        )
+        
+        # Skip frame if no cars detected
+        if len(cars) == 0:
+            continue
+            
+        # Create new trackers for each detection
+        currentCarID = 0  # Reset ID counter for each frame
+        for (x, y, w, h) in cars:
+            # Adjusted size filtering for long-distance vehicles
+            if w < 20 or h < 20 or w > WIDTH or h > HEIGHT:  # More permissive size constraints
+                continue
+                
+            # Create a new tracker for this detection
+            detection = (int(x), int(y), int(w), int(h))
+            new_tracker = VehicleTracker(detection, currentCarID)
+            vehicle_trackers[currentCarID] = new_tracker
+            currentCarID += 1
 
-        # Detect vehicles every few frames
-        if frameCounter % 5 == 0 or len(vehicle_trackers) == 0:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-            cars = carCascade.detectMultiScale(gray, 1.1, 13, 18, (24, 24))
-            
-            # Match detections to existing trackers
-            detections = [(int(_x), int(_y), int(_w), int(_h)) for (_x, _y, _w, _h) in cars]
-            matches, unmatched_detections = match_detections_to_trackers(detections, vehicle_trackers)
-            
-            # Update matched trackers
-            for detection, tracker_id in matches:
-                vehicle_trackers[tracker_id].update(detection)
-            
-            # Create new trackers for unmatched detections
-            for detection in unmatched_detections:
-                new_tracker = VehicleTracker(detection, currentCarID)
-                vehicle_trackers[currentCarID] = new_tracker
-                currentCarID += 1
-
-        # Update all trackers and draw results
-        trackers_to_delete = []
+        # Draw detection results
         for car_id, tracker in vehicle_trackers.items():
             x, y, w, h = tracker.get_state()
             
-            # Check if vehicle is still in frame
-            if x < 0 or y < 0 or x + w > WIDTH or y + h > HEIGHT:
-                trackers_to_delete.append(car_id)
-                continue
+            # Draw bounding box
+            cv2.rectangle(resultImage, (x, y), (x + w, y + h), (0, 255, 255), 2)
+            
+            # Calculate and display distance
+            distance = estimateDistance(w)
+            if 0 < distance < 50:  # Only show reasonable distances
+                # Draw ID and distance
+                cv2.putText(resultImage, f"ID: {car_id}", (x, y - 20),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+                cv2.putText(resultImage, f"Dist: {distance:.1f}m", (x, y - 5),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                 
             # Draw bounding box
             cv2.rectangle(resultImage, (x, y), (x + w, y + h), rectangleColor, 2)
             
             # Calculate and display distance
             distance = estimateDistance(w)
-            cv2.putText(resultImage, f"ID: {car_id}", (x, y - 20),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
-            cv2.putText(resultImage, f"Dist: {distance:.1f}m", (x, y - 5),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
             
-            # Calculate speed if we have previous position
-            current_centroid = tracker.get_centroid()
-            if car_id in last_centroids:
-                last_centroid = last_centroids[car_id]
-                time_diff = 1/30.0  # Assuming 30 fps
-                pixel_distance = calculate_distance(current_centroid, last_centroid)
-                speed_ms = pixel_distance * 0.1  # Approximate pixel to meter conversion
-                speed_kmh = speed_ms * 3.6
-                speeds[car_id] = speed_kmh
+            # Process and draw with extended range
+            if distance > 0 and distance < 200:  # Extended range to 200 meters
+                # Adjust text size based on distance
+                text_scale = max(0.4, 0.8 - (distance/100))  # Text gets smaller with distance
                 
-                if speeds[car_id] > 0:
-                    cv2.putText(resultImage, f"{speeds[car_id]:.1f} km/h",
-                              (x, y + h + 20), cv2.FONT_HERSHEY_SIMPLEX,
-                              0.6, (255, 0, 0), 2)
+                # Color coding based on distance
+                if distance < 50:
+                    distance_color = (0, 255, 0)  # Green for near vehicles
+                elif distance < 100:
+                    distance_color = (0, 255, 255)  # Yellow for medium distance
+                else:
+                    distance_color = (0, 0, 255)  # Red for far vehicles
+                
+                cv2.putText(resultImage, f"ID: {car_id}", (x, y - 20),
+                           cv2.FONT_HERSHEY_SIMPLEX, text_scale, (255, 0, 0), 2)
+                cv2.putText(resultImage, f"Dist: {distance:.1f}m", (x, y - 5),
+                           cv2.FONT_HERSHEY_SIMPLEX, text_scale, distance_color, 2)
+                
+                # Calculate speed if we have previous position
+                current_centroid = tracker.get_centroid()
+                if car_id in last_centroids:
+                    last_centroid = last_centroids[car_id]
+                    time_diff = 1/30.0  # Assuming 30 fps
+                    pixel_distance = calculate_distance(current_centroid, last_centroid)
+                    speed_ms = pixel_distance * 0.1  # Approximate pixel to meter conversion
+                    speed_kmh = speed_ms * 3.6
+                    
+                    # Only store reasonable speeds
+                    if 0 < speed_kmh < 150:  # reasonable speed range
+                        speeds[car_id] = speed_kmh
+                        
+                        cv2.putText(resultImage, f"{speed_kmh:.1f} km/h",
+                                  (x, y + h + 20), cv2.FONT_HERSHEY_SIMPLEX,
+                                  0.6, (255, 0, 0), 2)
+                
+                last_centroids[car_id] = current_centroid
+
+        # Only write frames that have valid detections
+        if len(vehicle_trackers) > 0:
+            # Draw frame information
+            cv2.putText(resultImage, f"Frame: {frameCounter}", (10, 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(resultImage, f"FPS: {current_fps:.1f}", (10, 60),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             
-            last_centroids[car_id] = current_centroid
-
-        # Remove trackers that are out of frame
-        for car_id in trackers_to_delete:
-            vehicle_trackers.pop(car_id, None)
-            last_centroids.pop(car_id, None)
-            speeds.pop(car_id, None)
-
-        # Write output video and show progress
-        out.write(resultImage)
+            # Write the frame only if we have valid detections
+            out.write(resultImage)
         
         # Print progress
         total_frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
