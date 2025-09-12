@@ -1,10 +1,28 @@
 import cv2
-import dlib
 import time
 import math
 
 # Classifier File (Haar Cascade)
 carCascade = cv2.CascadeClassifier("vech.xml")
+
+# Initialize OpenCV's multi-tracker
+def createTrackerByName():
+    tracker_types = ['BOOSTING', 'MIL', 'KCF', 'TLD', 'MEDIANFLOW', 'MOSSE', 'CSRT']
+    tracker_type = tracker_types[2]  # Using KCF tracker as it's widely available
+    if tracker_type == 'BOOSTING':
+        return cv2.legacy.TrackerBoosting.create()
+    elif tracker_type == 'MIL':
+        return cv2.legacy.TrackerMIL.create()
+    elif tracker_type == 'KCF':
+        return cv2.legacy.TrackerKCF.create()
+    elif tracker_type == 'TLD':
+        return cv2.legacy.TrackerTLD.create()
+    elif tracker_type == 'MEDIANFLOW':
+        return cv2.legacy.TrackerMedianFlow.create()
+    elif tracker_type == 'MOSSE':
+        return cv2.legacy.TrackerMOSSE.create()
+    elif tracker_type == 'CSRT':
+        return cv2.legacy.TrackerCSRT.create()
 
 # Video file capture
 video = cv2.VideoCapture("carsVideo4.mp4")
@@ -88,13 +106,17 @@ def trackMultipleObjects():
 
         # Remove Lost / Unmatched Objects
         for carID in list(carTracker.keys()):
-            trackingQuality = carTracker[carID].update(image)
+            success, bbox = carTracker[carID].update(image)
+            if not success:
+                trackingQuality = 0
+            else:
+                trackingQuality = 8
+                x, y, w, h = [int(v) for v in bbox]
 
-            pos = carTracker[carID].get_position()
             # Conditions to mark for deletion
-            if (trackingQuality < 7 or
-                pos.left() < 0 or pos.top() < 0 or
-                pos.right() > WIDTH or pos.bottom() > HEIGHT):
+            if (not success or trackingQuality < 7 or
+                x < 0 or y < 0 or
+                x + w > WIDTH or y + h > HEIGHT):
                 carIDtoDelete.append(carID)
 
         for carID in carIDtoDelete:
@@ -115,27 +137,28 @@ def trackMultipleObjects():
 
                 # Check if this detection overlaps significantly with an existing tracker
                 for carID in carTracker.keys():
-                    tracked_pos = carTracker[carID].get_position()
-                    t_x, t_y = int(tracked_pos.left()), int(tracked_pos.top())
-                    t_w, t_h = int(tracked_pos.width()), int(tracked_pos.height())
-
-                    if is_overlapping(x, y, w, h, t_x, t_y, t_w, t_h, threshold=0.6):
-                        matchCarID = carID
-                        break
+                    success, bbox = carTracker[carID].update(image)
+                    if success:
+                        t_x, t_y, t_w, t_h = [int(v) for v in bbox]
+                        if is_overlapping(x, y, w, h, t_x, t_y, t_w, t_h, threshold=0.6):
+                            matchCarID = carID
+                            break
 
                 # If no match found, create new tracker
                 if matchCarID is None:
-                    tracker = dlib.correlation_tracker()
-                    tracker.start_track(image, dlib.rectangle(x, y, x + w, y + h))
-                    carTracker[currentCarID] = tracker
-                    carLocation1[currentCarID] = [x, y, w, h]
-                    currentCarID += 1
+                    tracker = createTrackerByName()
+                    bbox = (x, y, w, h)
+                    success = tracker.init(image, bbox)
+                    if success:
+                        carTracker[currentCarID] = tracker
+                        carLocation1[currentCarID] = [x, y, w, h]
+                        currentCarID += 1
 
         # Draw tracked objects & Car ID
         for carID in carTracker.keys():
-            tracked_pos = carTracker[carID].get_position()
-            t_x, t_y = int(tracked_pos.left()), int(tracked_pos.top())
-            t_w, t_h = int(tracked_pos.width()), int(tracked_pos.height())
+            success, bbox = carTracker[carID].update(image)
+            if success:
+                t_x, t_y, t_w, t_h = [int(v) for v in bbox]
 
             cv2.rectangle(resultImage, (t_x, t_y), (t_x + t_w, t_y + t_h), rectangleColor, 4)
 
@@ -151,7 +174,7 @@ def trackMultipleObjects():
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
         # Show result and write output video
-        cv2.imshow('result', resultImage)
+        # cv2.imshow('result', resultImage)
         out.write(resultImage)
 
         if cv2.waitKey(1) == 27:  # Press ESC to exit
