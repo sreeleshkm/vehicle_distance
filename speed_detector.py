@@ -1,35 +1,129 @@
-import cv2
+import os
+os.environ["OPENCV_IO_ENABLE_JASPER"] = "0"
+os.environ["OPENCV_VIDEOIO_DEBUG"] = "0"
+os.environ["OPENCV_LOG_LEVEL"] = "OFF"
+os.environ["OPENCV_VIDEOIO_PRIORITY_BACKEND"] = "FFMPEG"
+os.environ["OPENCV_VIDEOIO_USE_GPU"] = "0"
+os.environ["OPENCV_OCL_RUNTIME"] = ""
+os.environ["OPENCV_FFMPEG_DEBUG"] = "0"
+
+import numpy as np
+import subprocess
+import json
 import time
 import math
+import cv2
 
-# Classifier File (Haar Cascade)
-carCascade = cv2.CascadeClassifier("vech.xml")
+# Configure OpenCV to use minimal features
+cv2.setNumThreads(1)
+if hasattr(cv2, 'ocl'):
+    cv2.ocl.setUseOpenCL(False)
 
-# Initialize OpenCV's multi-tracker
-def createTrackerByName():
-    tracker_types = ['BOOSTING', 'MIL', 'KCF', 'TLD', 'MEDIANFLOW', 'MOSSE', 'CSRT']
-    tracker_type = tracker_types[2]  # Using KCF tracker as it's widely available
-    if tracker_type == 'BOOSTING':
-        return cv2.legacy.TrackerBoosting.create()
-    elif tracker_type == 'MIL':
-        return cv2.legacy.TrackerMIL.create()
-    elif tracker_type == 'KCF':
-        return cv2.legacy.TrackerKCF.create()
-    elif tracker_type == 'TLD':
-        return cv2.legacy.TrackerTLD.create()
-    elif tracker_type == 'MEDIANFLOW':
-        return cv2.legacy.TrackerMedianFlow.create()
-    elif tracker_type == 'MOSSE':
-        return cv2.legacy.TrackerMOSSE.create()
-    elif tracker_type == 'CSRT':
-        return cv2.legacy.TrackerCSRT.create()
+try:
+    # Classifier File (Haar Cascade)
+    carCascade = cv2.CascadeClassifier("vech.xml")
+    if carCascade.empty():
+        print("Error: Could not load classifier file 'vech.xml'")
+        exit(1)
+except Exception as e:
+    print("Error loading classifier:", e)
+    exit(1)
 
-# Video file capture
-video = cv2.VideoCapture("carsVideo4.mp4")
+# Vehicle tracking using centroid-based approach
+class VehicleTracker:
+    def __init__(self, detection, car_id):
+        self.car_id = car_id
+        self.bbox = detection
+        self.time_since_update = 0
+        self.hits = 0
+        self.history = []
+        self.update(detection)
+    
+    def update(self, detection):
+        self.bbox = detection
+        self.time_since_update = 0
+        self.hits += 1
+        self.history.append(detection)
+        if len(self.history) > 30:  # Keep only last 30 frames
+            self.history.pop(0)
+        return True
 
-# Constants for YouTube Shorts size (vertical video)
-WIDTH = 600
-HEIGHT = 800
+    def get_state(self):
+        return self.bbox
+
+    def get_centroid(self):
+        x, y, w, h = self.bbox
+        return (int(x + w/2), int(y + h/2))
+
+def calculate_distance(centroid1, centroid2):
+    return np.sqrt(pow(centroid1[0] - centroid2[0], 2) + pow(centroid1[1] - centroid2[1], 2))
+
+def match_detections_to_trackers(detections, trackers, iou_threshold=0.3):
+    if len(trackers) == 0:
+        return [], detections
+
+    matches = []
+    unmatched_detections = detections.copy()
+    
+    for tracker_id, tracker in trackers.items():
+        tracker_bbox = tracker.get_state()
+        best_iou = iou_threshold
+        best_detection = None
+        
+        for detection in unmatched_detections:
+            iou = calculate_iou(detection, tracker_bbox)
+            if iou > best_iou:
+                best_iou = iou
+                best_detection = detection
+        
+        if best_detection is not None:
+            matches.append((best_detection, tracker_id))
+            unmatched_detections.remove(best_detection)
+    
+    return matches, unmatched_detections
+
+def calculate_iou(bbox1, bbox2):
+    x1, y1, w1, h1 = bbox1
+    x2, y2, w2, h2 = bbox2
+    
+    xi1 = max(x1, x2)
+    yi1 = max(y1, y2)
+    xi2 = min(x1 + w1, x2 + w2)
+    yi2 = min(y1 + h1, y2 + h2)
+    
+    intersection_area = max(0, xi2 - xi1) * max(0, yi2 - yi1)
+    
+    box1_area = w1 * h1
+    box2_area = w2 * h2
+    
+    union_area = box1_area + box2_area - intersection_area
+    
+    if union_area == 0:
+        return 0
+        
+    return intersection_area / union_area
+
+# Video file capture with minimal features
+def create_video_capture(filename):
+    try:
+        cap = cv2.VideoCapture(filename, cv2.CAP_FFMPEG)
+        if not cap.isOpened():
+            # Fallback to minimal configuration
+            cap = cv2.VideoCapture()
+            cap.open(filename, cv2.CAP_FFMPEG)
+        return cap
+    except Exception as e:
+        print(f"Error opening video: {e}")
+        return None
+
+video = create_video_capture("carsVideo4.mp4")
+if video is None:
+    print("Failed to open video file")
+    exit(1)
+
+# Constants for output video size (reduced size for performance)
+WIDTH = 480
+HEIGHT = 640
 
 # Known width of vehicle in meters (average)
 KNOWN_WIDTH = 1.8  
@@ -70,19 +164,65 @@ def is_overlapping(x, y, w, h, t_x, t_y, t_w, t_h, threshold=0.6):
     return iou > threshold
 
 # Tracking multiple objects
+def create_video_writer(input_video_path, fps, width, height):
+    try:
+        # Get the directory of the input video
+        output_dir = os.path.dirname(os.path.abspath(input_video_path))
+        if not output_dir:
+            output_dir = '/mnt/media'  # Fallback to media directory
+        
+        # Create timestamp for unique filename
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        output_filename = os.path.join(output_dir, f'processed_video_{timestamp}.avi')
+        
+        print(f"Will save processed video to: {output_filename}")
+        
+        # Try different codecs in order of preference
+        codecs = ['XVID', 'MJPG', 'MP4V']
+        
+        for codec in codecs:
+            try:
+                fourcc = cv2.VideoWriter_fourcc(*codec)
+                out = cv2.VideoWriter(output_filename, fourcc, fps, (width, height))
+                if out.isOpened():
+                    print(f"Successfully created video writer using {codec} codec")
+                    return out
+            except Exception as codec_error:
+                print(f"Failed with codec {codec}: {codec_error}")
+                continue
+        
+        print("Failed to create video writer with any available codec")
+        return None
+    except Exception as e:
+        print(f"Error creating video writer: {e}")
+        return None
+
 def trackMultipleObjects():
-    rectangleColor = (0, 255, 255)
-    frameCounter = 0
-    currentCarID = 0
+    try:
+        rectangleColor = (0, 255, 255)
+        frameCounter = 0
+        currentCarID = 0
 
-    carTracker = {}
-    carLocation1 = {}
-    carLocation2 = {}
-    speed = [None] * 1000
+        vehicle_trackers = {}
+        last_centroids = {}
+        speeds = {}
 
-    out = cv2.VideoWriter('outTraffic.avi', cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'), 10, (WIDTH, HEIGHT))
+        # Get the input video path
+        input_video = "carsVideo4.mp4"
+        input_video_path = os.path.abspath(input_video)
 
-    start_time = time.time()  # Timer for resetting trackers every 10 seconds
+        # Create video writer with error handling
+        out = create_video_writer(input_video_path, 10, WIDTH, HEIGHT)
+        if out is None:
+            print("Failed to create output video file")
+            return
+
+        print(f"Processing input video: {input_video_path}")
+        start_time = time.time()
+        last_detection_time = time.time()
+    except Exception as e:
+        print(f"Error initializing tracking: {e}")
+        return
 
     while True:
         rc, image = video.read()
@@ -94,93 +234,85 @@ def trackMultipleObjects():
         resultImage = image.copy()
         frameCounter += 1
 
-        # Reset all trackers and data every 10 seconds
+        # Reset trackers periodically to prevent drift
         if time.time() - start_time > 10:
-            carTracker.clear()
-            carLocation1.clear()
-            carLocation2.clear()
-            speed = [None] * 1000
+            vehicle_trackers.clear()
+            last_centroids.clear()
+            speeds.clear()
             start_time = time.time()
 
-        carIDtoDelete = []
-
-        # Remove Lost / Unmatched Objects
-        for carID in list(carTracker.keys()):
-            success, bbox = carTracker[carID].update(image)
-            if not success:
-                trackingQuality = 0
-            else:
-                trackingQuality = 8
-                x, y, w, h = [int(v) for v in bbox]
-
-            # Conditions to mark for deletion
-            if (not success or trackingQuality < 7 or
-                x < 0 or y < 0 or
-                x + w > WIDTH or y + h > HEIGHT):
-                carIDtoDelete.append(carID)
-
-        for carID in carIDtoDelete:
-            print(f"Removing carID {carID}")
-            carTracker.pop(carID, None)
-            carLocation1.pop(carID, None)
-            carLocation2.pop(carID, None)
-            speed[carID] = None
-
-        # Detect new cars every 10 frames
-        if frameCounter % 10 == 0:
+        # Detect vehicles every few frames
+        if frameCounter % 5 == 0 or len(vehicle_trackers) == 0:
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
             cars = carCascade.detectMultiScale(gray, 1.1, 13, 18, (24, 24))
+            
+            # Match detections to existing trackers
+            detections = [(int(_x), int(_y), int(_w), int(_h)) for (_x, _y, _w, _h) in cars]
+            matches, unmatched_detections = match_detections_to_trackers(detections, vehicle_trackers)
+            
+            # Update matched trackers
+            for detection, tracker_id in matches:
+                vehicle_trackers[tracker_id].update(detection)
+            
+            # Create new trackers for unmatched detections
+            for detection in unmatched_detections:
+                new_tracker = VehicleTracker(detection, currentCarID)
+                vehicle_trackers[currentCarID] = new_tracker
+                currentCarID += 1
 
-            for (_x, _y, _w, _h) in cars:
-                x, y, w, h = int(_x), int(_y), int(_w), int(_h)
-                matchCarID = None
+        # Update all trackers and draw results
+        trackers_to_delete = []
+        for car_id, tracker in vehicle_trackers.items():
+            x, y, w, h = tracker.get_state()
+            
+            # Check if vehicle is still in frame
+            if x < 0 or y < 0 or x + w > WIDTH or y + h > HEIGHT:
+                trackers_to_delete.append(car_id)
+                continue
+                
+            # Draw bounding box
+            cv2.rectangle(resultImage, (x, y), (x + w, y + h), rectangleColor, 2)
+            
+            # Calculate and display distance
+            distance = estimateDistance(w)
+            cv2.putText(resultImage, f"ID: {car_id}", (x, y - 20),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+            cv2.putText(resultImage, f"Dist: {distance:.1f}m", (x, y - 5),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            
+            # Calculate speed if we have previous position
+            current_centroid = tracker.get_centroid()
+            if car_id in last_centroids:
+                last_centroid = last_centroids[car_id]
+                time_diff = 1/30.0  # Assuming 30 fps
+                pixel_distance = calculate_distance(current_centroid, last_centroid)
+                speed_ms = pixel_distance * 0.1  # Approximate pixel to meter conversion
+                speed_kmh = speed_ms * 3.6
+                speeds[car_id] = speed_kmh
+                
+                if speeds[car_id] > 0:
+                    cv2.putText(resultImage, f"{speeds[car_id]:.1f} km/h",
+                              (x, y + h + 20), cv2.FONT_HERSHEY_SIMPLEX,
+                              0.6, (255, 0, 0), 2)
+            
+            last_centroids[car_id] = current_centroid
 
-                # Check if this detection overlaps significantly with an existing tracker
-                for carID in carTracker.keys():
-                    success, bbox = carTracker[carID].update(image)
-                    if success:
-                        t_x, t_y, t_w, t_h = [int(v) for v in bbox]
-                        if is_overlapping(x, y, w, h, t_x, t_y, t_w, t_h, threshold=0.6):
-                            matchCarID = carID
-                            break
+        # Remove trackers that are out of frame
+        for car_id in trackers_to_delete:
+            vehicle_trackers.pop(car_id, None)
+            last_centroids.pop(car_id, None)
+            speeds.pop(car_id, None)
 
-                # If no match found, create new tracker
-                if matchCarID is None:
-                    tracker = createTrackerByName()
-                    bbox = (x, y, w, h)
-                    success = tracker.init(image, bbox)
-                    if success:
-                        carTracker[currentCarID] = tracker
-                        carLocation1[currentCarID] = [x, y, w, h]
-                        currentCarID += 1
-
-        # Draw tracked objects & Car ID
-        for carID in carTracker.keys():
-            success, bbox = carTracker[carID].update(image)
-            if success:
-                t_x, t_y, t_w, t_h = [int(v) for v in bbox]
-
-            cv2.rectangle(resultImage, (t_x, t_y), (t_x + t_w, t_y + t_h), rectangleColor, 4)
-
-            # Draw carID at the top of the box
-            cv2.putText(resultImage, f"ID {carID}", (t_x, t_y - 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
-
-            carLocation2[carID] = [t_x, t_y, t_w, t_h]
-
-            # Distance Display
-            distance = estimateDistance(t_w)
-            cv2.putText(resultImage, f"{distance:.2f} m", (t_x, t_y - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-
-        # Show result and write output video
-        # cv2.imshow('result', resultImage)
+        # Write output video and show progress
         out.write(resultImage)
+        
+        # Print progress
+        total_frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
+        progress = (frameCounter / total_frames) * 100
+        print(f"\rProcessing: {progress:.1f}%", end="")
 
-        if cv2.waitKey(1) == 27:  # Press ESC to exit
-            break
-
-    cv2.destroyAllWindows()
+    print("\nProcessing complete!")
+    video.release()
     out.release()
 
 if __name__ == '__main__':
